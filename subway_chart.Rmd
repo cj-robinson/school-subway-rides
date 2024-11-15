@@ -1,0 +1,168 @@
+---
+title: "subways_chart"
+author: "CJ Robinson"
+date: "2024-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(httr2)
+library(lubridate)
+library(zoo)
+```
+
+## Data Pull
+
+Use API to grab past three years of subway data
+
+```{r cars}
+# Base URL for the API
+url <- "https://data.ny.gov/resource/wujg-7c2s.csv"
+
+# Function to fetch paginated results
+fetch_data <- function(limit, offset) {
+  query <- list(
+    "$query" = sprintf(
+      "SELECT transit_timestamp, transit_mode, station_complex_id, station_complex, borough, payment_method, fare_class_category, ridership, transfers, latitude, longitude, georeference WHERE ((transit_timestamp >= '2024-08-29' AND transit_timestamp <= '2024-10-08') OR (transit_timestamp >= '2022-08-29' AND transit_timestamp <= '2022-10-08') OR (transit_timestamp >= '2023-09-01' AND transit_timestamp <= '2023-10-12'))AND (fare_class_category = 'OMNY - Students' OR fare_class_category = 'Metrocard - Students') LIMIT %d OFFSET %d",
+      limit, offset
+    )
+  )
+
+  # Send the request with the query
+  response <- request(url) %>%
+    req_url_query(!!!query) %>%
+    req_perform()
+
+  # Return the CSV content as text
+  resp_body_string(response)
+}
+
+# Initialize an empty character string to store CSV text
+all_data_text <- ""
+
+# Define parameters
+limit <- 50000  # Fetch 50000 rows at a time
+offset <- 0     # Start from the first row
+max_rows <- 12000000  # Adjust based on the number of rows you want to fetch
+first_batch <- TRUE  # Flag to check if it's the first batch
+
+i = 0
+# Loop to fetch and combine data
+while (offset < max_rows) {
+  # Fetch a batch of data
+  i = i+1
+  print(paste("api call:", i))
+  new_data_text <- fetch_data(limit, offset)
+
+  # If it's not the first batch, remove the header (the first line)
+  if (!first_batch) {
+    new_data_text <- sub("^[^\n]+\n", "", new_data_text)
+  }
+
+  # Append the new data text to the existing combined text
+  all_data_text <- paste0(all_data_text, new_data_text)
+
+  # Set first_batch to FALSE after the first iteration
+  first_batch <- FALSE
+
+  # Increment the offset to fetch the next batch
+  offset <- offset + limit
+}
+
+# Read the combined CSV text into a dataframe with specified column types
+all_data <- read_csv(all_data_text, col_types = cols(
+  station_complex_id = col_character(),
+  transit_timestamp = col_character(),
+  ridership = col_double()
+))
+```
+
+Convert timestamp to lubridate and save
+
+```{r}
+ridership <- all_data %>%mutate(transit_timestamp = ymd_hms(transit_timestamp))
+
+ridership %>% distinct(date(transit_timestamp)) %>% arrange(`date(transit_timestamp)`)
+save(ridership, file = "ridership_data_student_2.RData")
+
+#load("ridership_data_student_2.RData")
+```
+
+## Data cleaning + exploratory plots + CSV
+
+```{r }
+day_riders <- ridership %>% 
+  # calculate the days since school start based on school start date for each year, found by googling
+  mutate(year = year(transit_timestamp), 
+         days_since_school_start = 
+           case_when(year(transit_timestamp) == 2023 ~ interval(ymd("2023-09-07"), date(transit_timestamp))/days() ,
+           year(transit_timestamp) == 2022 ~ interval(ymd("2022-09-08"), date(transit_timestamp))/days() ,
+                     year(transit_timestamp) == 2024 ~ interval(ymd("2024-09-05"), date(transit_timestamp))/days())) %>% 
+  # group by year and days since school start
+  group_by(year, days_since_school_start) %>% 
+  # sum total riders
+  summarize(riders = sum(ridership)) %>% 
+  filter(days_since_school_start <= 21, days_since_school_start >= 0)
+
+# export to csv
+day_riders %>% 
+  pivot_wider(names_from =year, values_from = riders) %>% 
+  write_csv(., "day_riders.csv")
+
+# graph 
+day_riders %>% 
+  ggplot(aes(x = days_since_school_start, y = riders, fill = factor(year))) +
+  #geom_bar(stat = "identity", alpha = .5) +
+  geom_line() +
+  scale_y_continuous(labels = scales::label_number_si()) +
+  theme_minimal()
+```
+
+## Extra plots 
+
+```{r}
+roll_avg <- ridership %>% 
+  mutate(year = year(transit_timestamp), 
+         days_since_school_start = 
+           case_when(year(transit_timestamp) == 2023 ~ interval(ymd("2023-09-07"), date(transit_timestamp))/days() ,
+                     year(transit_timestamp) == 2024 ~ interval(ymd("2024-09-05"), date(transit_timestamp))/days())) %>% 
+  filter(days_since_school_start <= 15) %>% 
+  arrange(year, days_since_school_start) %>% 
+  group_by(year, days_since_school_start) %>% 
+  summarize(riders = sum(ridership)) %>% 
+  mutate(riders = zoo::rollmean(riders, k = 7, fill = NA)) 
+
+
+roll_avg_pivot <- roll_avg %>% 
+  pivot_wider(names_from = "year", values_from = riders)
+
+write_csv(roll_avg_pivot, "roll_avg_pivot.csv")
+
+roll_avg %>% 
+  ggplot(aes(x = days_since_school_start, y = riders, color = factor(year))) +
+  #geom_bar(stat = "identity", alpha = .5) +
+  geom_line() + 
+  scale_y_continuous(labels = scales::label_number_si()) +
+  theme_minimal()
+```
+
+```{r}
+borough <- ridership %>% 
+  mutate(year = year(transit_timestamp), 
+         days_since_school_start = 
+           case_when(year(transit_timestamp) == 2023 ~ interval(ymd("2023-09-07"), date(transit_timestamp))/days() ,
+                     year(transit_timestamp) == 2024 ~ interval(ymd("2024-09-05"), date(transit_timestamp))/days())) %>% 
+  mutate(year = year(transit_timestamp)) %>% 
+  filter(days_since_school_start == 5) %>% 
+  group_by(year, borough) %>% 
+  summarize(riders = sum(ridership)) %>% 
+  dplyr::select(year, borough, riders) %>% 
+  pivot_wider(names_from = "year", values_from = riders) %>% 
+  mutate(diff = (`2024` - `2023`) / `2023`) %>% 
+  arrange(desc(diff))
+
+
+write_csv(borough, "borough_riders.csv")
+```
+
